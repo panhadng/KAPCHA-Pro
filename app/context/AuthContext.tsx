@@ -61,7 +61,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
           ...msalConfig,
           auth: {
             ...msalConfig.auth,
-            redirectUri: "http://localhost:3000", // Ensure this matches exactly what's in Azure
+            clientId: msalConfig.auth.clientId as string,
+            authority: msalConfig.auth.authority as string,
+            redirectUri: msalConfig.auth.redirectUri as string,
           },
         };
 
@@ -146,7 +148,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
       const response = await msalInstance.loginPopup({
         ...loginRequest,
-        redirectUri: "http://localhost:3000", // Ensure this is identical to what's in Azure
+        redirectUri: process.env.NEXT_PUBLIC_REDIRECT_URI, // Ensure this is identical to what's in Azure
       });
 
       console.log("Login successful");
