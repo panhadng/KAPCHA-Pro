@@ -20,6 +20,7 @@ interface AuthContextType {
   msalInstance: PublicClientApplication | null;
   isInitializing: boolean;
   clearMsalCache: () => void;
+  isInTeams: boolean;
 }
 
 const AuthContext = createContext<AuthContextType>({
@@ -31,6 +32,7 @@ const AuthContext = createContext<AuthContextType>({
   msalInstance: null,
   isInitializing: true,
   clearMsalCache: () => {},
+  isInTeams: false,
 });
 
 export const useAuth = () => useContext(AuthContext);
@@ -46,78 +48,102 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   const [msalInstance, setMsalInstance] =
     useState<PublicClientApplication | null>(null);
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
+  const [isInTeams, setIsInTeams] = useState<boolean>(false);
 
-  // Initialize Teams SDK and MSAL
+  // Initialize Teams SSO or MSAL
   useEffect(() => {
-    const initializeAuth = async () => {
-      if (typeof window === "undefined") {
-        return;
-      }
+    // Skip on server-side
+    if (typeof window === "undefined") return;
 
+    const initializeAuth = async () => {
       try {
         setIsInitializing(true);
 
-        // Initialize Teams SDK
-        await microsoftTeams.initialize();
+        // Check if we're in an iframe (Teams)
+        const inIframe = window.self !== window.top;
+        setIsInTeams(inIframe);
 
-        // Check if we're running in Teams
-        const context = await microsoftTeams.app.getContext();
-        const isInTeams = context !== null;
+        if (inIframe) {
+          // We're likely in Teams
+          console.log("In iframe - attempting Teams SSO");
 
-        if (isInTeams) {
-          // We're in Teams, use Teams SSO
           try {
-            const authTokenRequest = {
-              successCallback: (token: string) => {
-                setAccessToken(token);
-                setIsAuthenticated(true);
-                // You might want to decode the token to get user info
-                // or make a Graph API call to get user details
-              },
-              failureCallback: (error: string) => {
-                console.error("Failed to get auth token:", error);
-                setIsAuthenticated(false);
-              },
-              resources: ["https://graph.microsoft.com/User.Read"],
-            };
-
-            microsoftTeams.authentication.getAuthToken(authTokenRequest);
-          } catch (error) {
-            console.error("Error getting Teams auth token:", error);
+            // Wait for Teams SDK to be ready
+            setTimeout(() => {
+              console.log("Attempting Teams getAuthToken");
+              // Try to get Teams auth token
+              microsoftTeams.authentication.getAuthToken({
+                successCallback: (token: string) => {
+                  console.log("Teams SSO successful");
+                  setAccessToken(token);
+                  setIsAuthenticated(true);
+                  setIsInitializing(false);
+                },
+                failureCallback: (error: string) => {
+                  console.error("Teams SSO failed:", error);
+                  // Fall back to MSAL if Teams SSO fails
+                  initializeMsal();
+                },
+                resources: ["https://graph.microsoft.com/User.Read"],
+              });
+            }, 500);
+          } catch (teamsSsoError) {
+            console.error(
+              "Error with Teams SSO, falling back to MSAL:",
+              teamsSsoError
+            );
+            // Fall back to MSAL
+            initializeMsal();
           }
         } else {
-          // We're not in Teams, fall back to regular MSAL
-          const fixedMsalConfig = {
-            ...msalConfig,
-            auth: {
-              ...msalConfig.auth,
-              clientId: msalConfig.auth.clientId as string,
-              authority: msalConfig.auth.authority as string,
-              redirectUri: msalConfig.auth.redirectUri as string,
-            },
-          };
-
-          const msalInstanceObj = new PublicClientApplication(fixedMsalConfig);
-          await msalInstanceObj.initialize();
-          setMsalInstance(msalInstanceObj);
-
-          const accounts = msalInstanceObj.getAllAccounts();
-          if (accounts.length > 0) {
-            setIsAuthenticated(true);
-            setUser(accounts[0]);
-            try {
-              const response = await msalInstanceObj.acquireTokenSilent({
-                ...loginRequest,
-                account: accounts[0],
-              });
-              setAccessToken(response.accessToken);
-            } catch (tokenError) {
-              console.error("Error acquiring token silently:", tokenError);
-            }
-          }
+          // Not in Teams, use MSAL
+          console.log("Not in Teams - using MSAL");
+          initializeMsal();
         }
       } catch (error) {
-        console.error("Error initializing auth:", error);
+        console.error("Auth initialization error:", error);
+        setIsInitializing(false);
+      }
+    };
+
+    const initializeMsal = async () => {
+      try {
+        console.log("Initializing MSAL...");
+        const fixedMsalConfig = {
+          ...msalConfig,
+          auth: {
+            ...msalConfig.auth,
+            clientId: msalConfig.auth.clientId as string,
+            authority: msalConfig.auth.authority as string,
+            redirectUri: msalConfig.auth.redirectUri as string,
+          },
+        };
+
+        const msalInstanceObj = new PublicClientApplication(fixedMsalConfig);
+        await msalInstanceObj.initialize();
+        console.log("MSAL initialized");
+        setMsalInstance(msalInstanceObj);
+
+        const accounts = msalInstanceObj.getAllAccounts();
+        if (accounts.length > 0) {
+          console.log("Found existing MSAL account");
+          setIsAuthenticated(true);
+          setUser(accounts[0]);
+
+          try {
+            // Silently acquire token if account exists
+            const response = await msalInstanceObj.acquireTokenSilent({
+              ...loginRequest,
+              account: accounts[0],
+            });
+            console.log("Token acquired silently");
+            setAccessToken(response.accessToken);
+          } catch (tokenError) {
+            console.error("Error acquiring token silently:", tokenError);
+          }
+        }
+      } catch (msalError) {
+        console.error("MSAL initialization error:", msalError);
       } finally {
         setIsInitializing(false);
       }
@@ -134,7 +160,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
 
     try {
+      console.log("Starting login popup");
       const response = await msalInstance.loginPopup(loginRequest);
+      console.log("Login successful");
       setIsAuthenticated(true);
       setUser(response.account);
       setAccessToken(response.accessToken);
@@ -145,26 +173,31 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
   // Logout function
   const logout = () => {
-    if (!msalInstance) {
-      console.error("MSAL not initialized yet");
-      return;
-    }
-
-    try {
-      // Clear session storage
-      for (let i = 0; i < sessionStorage.length; i++) {
-        const key = sessionStorage.key(i);
-        if (key && (key.includes("msal") || key.includes("interaction"))) {
-          sessionStorage.removeItem(key);
-        }
-      }
-
-      msalInstance.logout();
+    if (isInTeams) {
+      // In Teams, just clear local state
+      console.log("Teams logout - clearing local state");
       setIsAuthenticated(false);
       setUser(null);
       setAccessToken(null);
-    } catch (error) {
-      console.error("Logout error:", error);
+    } else if (msalInstance) {
+      // MSAL logout
+      try {
+        console.log("MSAL logout");
+        // Clear session storage
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const key = sessionStorage.key(i);
+          if (key && (key.includes("msal") || key.includes("interaction"))) {
+            sessionStorage.removeItem(key);
+          }
+        }
+
+        msalInstance.logout();
+        setIsAuthenticated(false);
+        setUser(null);
+        setAccessToken(null);
+      } catch (error) {
+        console.error("Logout error:", error);
+      }
     }
   };
 
@@ -185,6 +218,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         msalInstance,
         isInitializing,
         clearMsalCache,
+        isInTeams,
       }}
     >
       {children}
