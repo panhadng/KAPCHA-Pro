@@ -9,6 +9,7 @@ import React, {
 } from "react";
 import { PublicClientApplication, AccountInfo } from "@azure/msal-browser";
 import { msalConfig, loginRequest } from "../config/authConfig";
+import * as microsoftTeams from "@microsoft/teams-js";
 
 interface AuthContextType {
   isAuthenticated: boolean;
@@ -46,79 +47,83 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     useState<PublicClientApplication | null>(null);
   const [isInitializing, setIsInitializing] = useState<boolean>(true);
 
-  // Initialize MSAL instance
+  // Initialize Teams SDK and MSAL
   useEffect(() => {
-    const initializeMsal = async () => {
+    const initializeAuth = async () => {
       if (typeof window === "undefined") {
-        return; // Skip on server-side
+        return;
       }
 
       try {
         setIsInitializing(true);
 
-        // Create a fixed config to ensure redirectUri is properly formatted
-        const fixedMsalConfig = {
-          ...msalConfig,
-          auth: {
-            ...msalConfig.auth,
-            clientId: msalConfig.auth.clientId as string,
-            authority: msalConfig.auth.authority as string,
-            redirectUri: msalConfig.auth.redirectUri as string,
-          },
-        };
+        // Initialize Teams SDK
+        await microsoftTeams.initialize();
 
-        // Log configuration values
-        console.log("MSAL Config:", {
-          clientId: fixedMsalConfig.auth.clientId,
-          authority: fixedMsalConfig.auth.authority,
-          redirectUri: fixedMsalConfig.auth.redirectUri,
-        });
+        // Check if we're running in Teams
+        const context = await microsoftTeams.app.getContext();
+        const isInTeams = context !== null;
 
-        console.log("Initializing MSAL...");
-
-        // Create a new MSAL instance with fixed config
-        const msalInstanceObj = new PublicClientApplication(fixedMsalConfig);
-
-        // Explicitly initialize MSAL
-        await msalInstanceObj.initialize();
-        console.log("MSAL initialized successfully");
-
-        // Set the instance
-        setMsalInstance(msalInstanceObj);
-
-        // Check if a user is already signed in
-        const accounts = msalInstanceObj.getAllAccounts();
-        console.log(`Found ${accounts.length} accounts`);
-
-        if (accounts.length > 0) {
-          setIsAuthenticated(true);
-          setUser(accounts[0]);
-
+        if (isInTeams) {
+          // We're in Teams, use Teams SSO
           try {
-            // Acquire token silently
-            const response = await msalInstanceObj.acquireTokenSilent({
-              ...loginRequest,
-              account: accounts[0],
-            });
-            setAccessToken(response.accessToken);
-            console.log("Token acquired successfully");
-          } catch (tokenError) {
-            console.error("Error acquiring token silently:", tokenError);
+            const authTokenRequest = {
+              successCallback: (token: string) => {
+                setAccessToken(token);
+                setIsAuthenticated(true);
+                // You might want to decode the token to get user info
+                // or make a Graph API call to get user details
+              },
+              failureCallback: (error: string) => {
+                console.error("Failed to get auth token:", error);
+                setIsAuthenticated(false);
+              },
+              resources: ["https://graph.microsoft.com/User.Read"],
+            };
+
+            microsoftTeams.authentication.getAuthToken(authTokenRequest);
+          } catch (error) {
+            console.error("Error getting Teams auth token:", error);
+          }
+        } else {
+          // We're not in Teams, fall back to regular MSAL
+          const fixedMsalConfig = {
+            ...msalConfig,
+            auth: {
+              ...msalConfig.auth,
+              clientId: msalConfig.auth.clientId as string,
+              authority: msalConfig.auth.authority as string,
+              redirectUri: msalConfig.auth.redirectUri as string,
+            },
+          };
+
+          const msalInstanceObj = new PublicClientApplication(fixedMsalConfig);
+          await msalInstanceObj.initialize();
+          setMsalInstance(msalInstanceObj);
+
+          const accounts = msalInstanceObj.getAllAccounts();
+          if (accounts.length > 0) {
+            setIsAuthenticated(true);
+            setUser(accounts[0]);
+            try {
+              const response = await msalInstanceObj.acquireTokenSilent({
+                ...loginRequest,
+                account: accounts[0],
+              });
+              setAccessToken(response.accessToken);
+            } catch (tokenError) {
+              console.error("Error acquiring token silently:", tokenError);
+            }
           }
         }
       } catch (error) {
-        console.error("Error initializing MSAL:", error);
+        console.error("Error initializing auth:", error);
       } finally {
         setIsInitializing(false);
       }
     };
 
-    initializeMsal();
-
-    // Clean up
-    return () => {
-      // Any cleanup code if needed
-    };
+    initializeAuth();
   }, []);
 
   // Login function
@@ -128,68 +133,25 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       return;
     }
 
-    if (isInitializing) {
-      console.error("MSAL is still initializing");
-      return;
-    }
-
     try {
-      console.log("Attempting login with fixed redirectUri");
-
-      // Attempt to clear any existing interaction in progress
-      const sessionStorageKeys = Object.keys(sessionStorage);
-      const inProgressKey = sessionStorageKeys.find((key) =>
-        key.includes("interaction.status")
-      );
-      if (inProgressKey) {
-        console.log("Found existing interaction in progress. Clearing it...");
-        sessionStorage.removeItem(inProgressKey);
-      }
-
-      const response = await msalInstance.loginPopup({
-        ...loginRequest,
-        redirectUri: process.env.NEXT_PUBLIC_REDIRECT_URI, // Ensure this is identical to what's in Azure
-      });
-
-      console.log("Login successful");
+      const response = await msalInstance.loginPopup(loginRequest);
       setIsAuthenticated(true);
       setUser(response.account);
       setAccessToken(response.accessToken);
     } catch (error) {
       console.error("Login error:", error);
-      // If there's a browser interaction error, try to clear the MSAL cache
-      if (
-        error instanceof Error &&
-        error.message.includes("interaction_in_progress")
-      ) {
-        console.log(
-          "Detected interaction_in_progress error, clearing MSAL cache..."
-        );
-
-        // Clear session storage
-        for (let i = 0; i < sessionStorage.length; i++) {
-          const key = sessionStorage.key(i);
-          if (key && key.includes("msal")) {
-            sessionStorage.removeItem(key);
-          }
-        }
-
-        // Inform the user
-        alert("Login process was interrupted. Please try signing in again.");
-      }
     }
   };
 
   // Logout function
   const logout = () => {
-    if (!msalInstance || isInitializing) {
+    if (!msalInstance) {
       console.error("MSAL not initialized yet");
       return;
     }
 
     try {
-      // Properly clear all MSAL-related data
-      // 1. Clear session storage
+      // Clear session storage
       for (let i = 0; i < sessionStorage.length; i++) {
         const key = sessionStorage.key(i);
         if (key && (key.includes("msal") || key.includes("interaction"))) {
@@ -197,71 +159,19 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         }
       }
 
-      // 2. Normal logout
       msalInstance.logout();
-
-      // 3. Update state
       setIsAuthenticated(false);
       setUser(null);
       setAccessToken(null);
-
-      console.log("Logout completed and session cleared");
     } catch (error) {
       console.error("Logout error:", error);
-      // Force state reset even if the logout fails
-      setIsAuthenticated(false);
-      setUser(null);
-      setAccessToken(null);
     }
   };
 
-  // Utility function to clear MSAL cache
   const clearMsalCache = () => {
-    console.log("Manually clearing MSAL cache");
-
-    // Clear both session and local storage
-    for (let i = 0; i < sessionStorage.length; i++) {
-      const key = sessionStorage.key(i);
-      if (key && (key.includes("msal") || key.includes("interaction"))) {
-        console.log(`Removing session storage key: ${key}`);
-        sessionStorage.removeItem(key);
-      }
-    }
-
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && (key.includes("msal") || key.includes("interaction"))) {
-        console.log(`Removing local storage key: ${key}`);
-        localStorage.removeItem(key);
-      }
-    }
-
-    // Reset the state
-    setIsAuthenticated(false);
-    setUser(null);
-    setAccessToken(null);
-
-    // If msalInstance exists, clear the accounts
     if (msalInstance) {
-      try {
-        const accounts = msalInstance.getAllAccounts();
-        console.log(`Clearing ${accounts.length} accounts from MSAL instance`);
-
-        // The correct method for MSAL v2
-        accounts.forEach((account) => {
-          if (msalInstance.getAccountByUsername(account.username)) {
-            console.log(`Clearing account: ${account.username}`);
-          }
-        });
-
-        // Force clear the token cache
-        console.log("Clearing token cache through storage");
-      } catch (e) {
-        console.error("Error clearing MSAL accounts:", e);
-      }
+      msalInstance.clearCache();
     }
-
-    console.log("MSAL cache cleared");
   };
 
   return (

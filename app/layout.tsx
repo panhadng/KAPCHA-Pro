@@ -1,7 +1,10 @@
+"use client";
+
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { AuthProvider } from "./context/AuthContext";
+import * as microsoftTeams from "@microsoft/teams-js";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -12,6 +15,11 @@ const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
 });
+
+// Initialize Teams SDK
+if (typeof window !== "undefined") {
+  microsoftTeams.initialize();
+}
 
 export const metadata: Metadata = {
   title: "Teams Messaging App",
