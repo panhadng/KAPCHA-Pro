@@ -160,14 +160,47 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
 
     try {
+      // Handle any in-progress interactions first
+      try {
+        await msalInstance.handleRedirectPromise();
+      } catch {
+        // Ignore errors from handleRedirectPromise
+      }
+
       console.log("Starting login popup");
       const response = await msalInstance.loginPopup(loginRequest);
       console.log("Login successful");
       setIsAuthenticated(true);
       setUser(response.account);
       setAccessToken(response.accessToken);
-    } catch (error) {
+    } catch (error: unknown) {
       console.error("Login error:", error);
+
+      // Handle interaction_in_progress error
+      if (
+        error &&
+        typeof error === "object" &&
+        "name" in error &&
+        "message" in error &&
+        error.name === "BrowserAuthError" &&
+        typeof error.message === "string" &&
+        error.message.includes("interaction_in_progress")
+      ) {
+        // Clear browser state
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const key = sessionStorage.key(i);
+          if (key && key.includes("msal.interaction")) {
+            console.log("Removing interaction key:", key);
+            sessionStorage.removeItem(key);
+          }
+        }
+
+        // Wait and retry after clearing interaction
+        setTimeout(() => {
+          console.log("Retrying login after clearing interaction...");
+          login();
+        }, 1000);
+      }
     }
   };
 
